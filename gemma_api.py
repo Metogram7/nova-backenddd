@@ -19,7 +19,7 @@ user_memory = {}
 AFK_MODE = {"active": False, "last_active": time.time(), "speed_multiplier": 1.0}
 executor = ThreadPoolExecutor(max_workers=5)
 
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"  # Google Gemini API Key
+GEMINI_API_KEY = "AIzaSyBqWOT3n3LA8hJBriMGFFrmanLfkIEjhr0"  # Google Gemini API Key
 MODEL_NAME = "gemini-2.5-flash"
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 
