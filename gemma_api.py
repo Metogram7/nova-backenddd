@@ -5,14 +5,16 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+import json
 
 app = Flask(__name__)
 CORS(app)
 
-# --- Cache ve AFK yönetimi ---
+# --- Cache, AFK ve Kullanıcı hafızası ---
 gemma_cache = {}
 AFK_MODE = {"active": False, "last_active": time.time(), "speed_multiplier": 1.0}
 executor = ThreadPoolExecutor(max_workers=5)
+user_memory = {}  # 🔥 Kullanıcı bilgileri hafızası
 
 GEMINI_API_KEY = "AIzaSyBqWOT3n3LA8hJBriMGFFrmanLfkIEjhr0"
 MODEL_NAME = "gemini-2.5-flash"
@@ -43,7 +45,7 @@ def afk_warmup():
             test_messages = ["Merhaba!", "Nasılsın?", "Hava bugün nasıl?", "Bugün hava güzel mi?", "Selam!"]
             for msg in test_messages:
                 executor.submit(warmup_message, msg)
-            AFK_MODE["speed_multiplier"] = 0.5  # yarı sürede yanıt
+            AFK_MODE["speed_multiplier"] = 0.5
         else:
             AFK_MODE["active"] = False
             AFK_MODE["speed_multiplier"] = 1.0
@@ -53,7 +55,10 @@ threading.Thread(target=afk_warmup, daemon=True).start()
 # --- API Route ---
 @app.route("/gemma", methods=["POST"])
 def gemma():
-    user_mesaj = request.json.get("message", "")
+    req_json = request.json
+    user_id = req_json.get("userId", "default")
+    user_mesaj = req_json.get("message", "")
+    
     if not user_mesaj:
         return jsonify({"response": "Mesaj boş"}), 400
 
@@ -61,12 +66,28 @@ def gemma():
     AFK_MODE["last_active"] = time.time()
     speed = AFK_MODE["speed_multiplier"]
 
+    # Kullanıcı hafızasını başlat
+    if user_id not in user_memory:
+        user_memory[user_id] = {"info": {}, "conversation": []}
+
+    # Konuşmayı hafızaya ekle
+    user_memory[user_id]["conversation"].append({"role": "user", "text": user_mesaj})
+
     # Cache kontrol
     if user_mesaj in gemma_cache:
-        return jsonify({"response": gemma_cache[user_mesaj]})
+        reply = gemma_cache[user_mesaj]
+        user_memory[user_id]["conversation"].append({"role": "nova", "text": reply})
+        return jsonify({"response": reply})
 
-    # API çağrısı
-    payload = {"contents":[{"parts":[{"text":user_mesaj}]}]}
+    # Prompt oluştur (hafızadaki bilgilerle)
+    memory_context = json.dumps(user_memory[user_id], ensure_ascii=False)
+    prompt = (
+        f"Kullanıcıyla geçmiş konuşmalar: {memory_context}\n"
+        f"Kullanıcı yeni mesajı: {user_mesaj}\n"
+        f"Bu bilgilere dayanarak kişisel ve ilgili bir yanıt üret."
+    )
+
+    payload = {"contents":[{"parts":[{"text":prompt}]}]}
     headers = {"Content-Type":"application/json", "x-goog-api-key": GEMINI_API_KEY}
 
     try:
@@ -75,8 +96,13 @@ def gemma():
         data = resp.json()
         candidates = data.get("candidates", [])
         text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        gemma_cache[user_mesaj] = text or "⚠️ Yanıt boş."
-        return jsonify({"response": gemma_cache[user_mesaj]})
+        text = text or "⚠️ Yanıt boş."
+        
+        # Cache ve hafıza güncelle
+        gemma_cache[user_mesaj] = text
+        user_memory[user_id]["conversation"].append({"role": "nova", "text": text})
+
+        return jsonify({"response": text})
     except Exception as e:
         return jsonify({"response": f"⚠️ Hata: {e}"}), 500
 
