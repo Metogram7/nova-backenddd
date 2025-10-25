@@ -14,14 +14,21 @@ CORS(app)
 DATA_DIR = r"D:\kullanıcılar"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-gemma_cache = {}
+nova_cache = {}
 user_memory = {}
 AFK_MODE = {"active": False, "last_active": time.time(), "speed_multiplier": 1.0}
 executor = ThreadPoolExecutor(max_workers=5)
 
-GEMINI_API_KEY = "AIzaSyBqWOT3n3LA8hJBriMGFFrmanLfkIEjhr0"  # Google Gemini API Key
+GEMINI_API_KEY = "AIzaSyBqWOT3n3LA8hJBriMGFFrmanLfkIEjhr0"
 MODEL_NAME = "gemini-2.5-flash"
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
+
+# --- Nova bilgisi (eğitim) ---
+DEFAULT_NOVA_INFO = {
+    "ad": "Nova",
+    "gelistirici": "Metehan",
+    "tarih": time.strftime("%Y-%m-%d")
+}
 
 # --- Yardımcı Fonksiyonlar ---
 def get_user_path(user_id):
@@ -40,9 +47,9 @@ def save_user_memory(user_id):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(user_memory[user_id], f, ensure_ascii=False, indent=2)
 
+# --- AFK ve paralel hazırlık ---
 def warmup_message(msg):
-    if msg in gemma_cache:
-        return
+    if msg in nova_cache: return
     try:
         payload = {"contents":[{"parts":[{"text":msg}]}]}
         headers = {"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY}
@@ -51,15 +58,15 @@ def warmup_message(msg):
         data = resp.json()
         candidates = data.get("candidates", [])
         text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        gemma_cache[msg] = text
+        nova_cache[msg] = text
     except:
-        gemma_cache[msg] = "⚠️ Hazırlık hatası"
+        nova_cache[msg] = "⚠️ Hazırlık hatası"
 
 def afk_warmup():
     while True:
         time.sleep(10)
         idle_time = time.time() - AFK_MODE["last_active"]
-        if idle_time > 60:  # 1 dk AFK
+        if idle_time > 60:
             AFK_MODE["active"] = True
             for msg in ["Merhaba!", "Nasılsın?", "Hava bugün nasıl?", "Selam!"]:
                 executor.submit(warmup_message, msg)
@@ -70,9 +77,9 @@ def afk_warmup():
 
 threading.Thread(target=afk_warmup, daemon=True).start()
 
-# --- API Route ---
-@app.route("/gemma", methods=["POST"])
-def gemma():
+# --- Nova API ---
+@app.route("/nova", methods=["POST"])
+def nova():
     req_json = request.json
     user_id = req_json.get("userId", "default")
     user_mesaj = req_json.get("message", "")
@@ -84,15 +91,13 @@ def gemma():
     AFK_MODE["last_active"] = time.time()
     speed = AFK_MODE["speed_multiplier"]
 
-    # Kullanıcı hafızasını yükle
     if user_id not in user_memory:
         load_user_memory(user_id)
 
-    # Konuşmayı hafızaya ekle
+    # Konuşmayı ve kullanıcı bilgilerini ekle
     user_memory[user_id]["conversation"].append({"role": "user", "text": user_mesaj})
-
-    # Kullanıcı bilgilerini güncelle
     user_memory[user_id]["info"].update(user_info)
+    user_memory[user_id]["info"].update(DEFAULT_NOVA_INFO)
 
     # Prompt oluştur
     memory_context = json.dumps(user_memory[user_id], ensure_ascii=False)
@@ -113,8 +118,7 @@ def gemma():
         text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
         text = text or "⚠️ Yanıt boş."
 
-        # Cache ve hafıza güncelle
-        gemma_cache[user_mesaj] = text
+        nova_cache[user_mesaj] = text
         user_memory[user_id]["conversation"].append({"role": "nova", "text": text})
         save_user_memory(user_id)
 
