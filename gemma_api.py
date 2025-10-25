@@ -5,7 +5,7 @@ import os
 import json
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 CORS(app)
@@ -17,7 +17,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 gemma_cache = {}
 user_memory = {}
 AFK_MODE = {"active": False, "last_active": time.time(), "speed_multiplier": 1.0}
-executor = ThreadPoolExecutor(max_workers=2)  # Daha az paralel istek
+executor = ThreadPoolExecutor(max_workers=1)  # 429 önlemek için tek iş parçacığı
 
 GEMINI_API_KEY = "AIzaSyBqWOT3n3LA8hJBriMGFFrmanLfkIEjhr0"
 MODEL_NAME = "gemini-2.5-flash"
@@ -40,20 +40,22 @@ def save_user_memory(user_id):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(user_memory[user_id], f, ensure_ascii=False, indent=2)
 
-# --- API Çağrısı (Retry + Backoff) ---
+# --- API Çağrısı (Retry + Backoff + Rate Limit) ---
 def call_gemini_api(payload):
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
-    for i in range(5):  # 5 kez dene
+    for attempt in range(5):
         try:
             resp = requests.post(GEMINI_API_URL, json=payload, headers=headers, timeout=30)
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.HTTPError as e:
             if resp.status_code == 429:
-                time.sleep(2 ** i)  # Üstel backoff: 2,4,8,16,32 saniye
+                wait = 2 ** attempt
+                print(f"⚠️ 429 alındı, {wait} saniye bekleniyor...")
+                time.sleep(wait)
             else:
                 raise
-        except Exception:
+        except Exception as e:
             time.sleep(1)
     return {"candidates": [{"content": {"parts": [{"text": "⚠️ API limit aşıldı veya hata oluştu."}]}}]}
 
@@ -71,10 +73,11 @@ def afk_warmup():
     while True:
         time.sleep(10)
         idle_time = time.time() - AFK_MODE["last_active"]
-        if idle_time > 60:  # 1 dk AFK
+        if idle_time > 60:
             AFK_MODE["active"] = True
+            # Tek tek sırayla çalıştırıyoruz
             for msg in ["Merhaba!", "Nasılsın?", "Hava bugün nasıl?", "Selam!"]:
-                executor.submit(warmup_message, msg)
+                warmup_message(msg)
             AFK_MODE["speed_multiplier"] = 0.5
         else:
             AFK_MODE["active"] = False
@@ -94,7 +97,6 @@ def gemma():
         return jsonify({"response": "Mesaj boş"}), 400
 
     AFK_MODE["last_active"] = time.time()
-    speed = AFK_MODE["speed_multiplier"]
 
     if user_id not in user_memory:
         load_user_memory(user_id)
@@ -114,8 +116,8 @@ def gemma():
         text = gemma_cache[user_mesaj]
     else:
         payload = {"contents":[{"parts":[{"text":prompt}]}]}
-        data = call_gemini_api(payload)
-        candidates = data.get("candidates", [])
+        text_data = call_gemini_api(payload)
+        candidates = text_data.get("candidates", [])
         text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
         text = text or "⚠️ Yanıt boş."
         gemma_cache[user_mesaj] = text
