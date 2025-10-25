@@ -17,9 +17,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 gemma_cache = {}
 user_memory = {}
 AFK_MODE = {"active": False, "last_active": time.time(), "speed_multiplier": 1.0}
-executor = ThreadPoolExecutor(max_workers=5)
+executor = ThreadPoolExecutor(max_workers=2)  # Daha az paralel istek
 
-GEMINI_API_KEY = "AIzaSyBqWOT3n3LA8hJBriMGFFrmanLfkIEjhr0"  # Google Gemini API Key
+GEMINI_API_KEY = "AIzaSyBqWOT3n3LA8hJBriMGFFrmanLfkIEjhr0"
 MODEL_NAME = "gemini-2.5-flash"
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 
@@ -40,20 +40,32 @@ def save_user_memory(user_id):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(user_memory[user_id], f, ensure_ascii=False, indent=2)
 
+# --- API Çağrısı (Retry + Backoff) ---
+def call_gemini_api(payload):
+    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
+    for i in range(5):  # 5 kez dene
+        try:
+            resp = requests.post(GEMINI_API_URL, json=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            if resp.status_code == 429:
+                time.sleep(2 ** i)  # Üstel backoff: 2,4,8,16,32 saniye
+            else:
+                raise
+        except Exception:
+            time.sleep(1)
+    return {"candidates": [{"content": {"parts": [{"text": "⚠️ API limit aşıldı veya hata oluştu."}]}}]}
+
+# --- AFK Hazırlık ---
 def warmup_message(msg):
     if msg in gemma_cache:
         return
-    try:
-        payload = {"contents":[{"parts":[{"text":msg}]}]}
-        headers = {"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY}
-        resp = requests.post(GEMINI_API_URL, json=payload, headers=headers, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        candidates = data.get("candidates", [])
-        text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        gemma_cache[msg] = text
-    except:
-        gemma_cache[msg] = "⚠️ Hazırlık hatası"
+    payload = {"contents":[{"parts":[{"text":msg}]}]}
+    data = call_gemini_api(payload)
+    candidates = data.get("candidates", [])
+    text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+    gemma_cache[msg] = text or "⚠️ Hazırlık hatası"
 
 def afk_warmup():
     while True:
@@ -84,17 +96,12 @@ def gemma():
     AFK_MODE["last_active"] = time.time()
     speed = AFK_MODE["speed_multiplier"]
 
-    # Kullanıcı hafızasını yükle
     if user_id not in user_memory:
         load_user_memory(user_id)
 
-    # Konuşmayı hafızaya ekle
     user_memory[user_id]["conversation"].append({"role": "user", "text": user_mesaj})
-
-    # Kullanıcı bilgilerini güncelle
     user_memory[user_id]["info"].update(user_info)
 
-    # Prompt oluştur
     memory_context = json.dumps(user_memory[user_id], ensure_ascii=False)
     prompt = (
         f"Kullanıcıyla geçmiş konuşmalar: {memory_context}\n"
@@ -102,25 +109,21 @@ def gemma():
         "Bu bilgilere dayanarak kişisel ve ilgili bir yanıt üret ve cevabı Türkçe ver."
     )
 
-    payload = {"contents":[{"parts":[{"text":prompt}]}]}
-    headers = {"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY}
-
-    try:
-        resp = requests.post(GEMINI_API_URL, json=payload, headers=headers, timeout=30*speed)
-        resp.raise_for_status()
-        data = resp.json()
+    # Cache kontrolü
+    if user_mesaj in gemma_cache:
+        text = gemma_cache[user_mesaj]
+    else:
+        payload = {"contents":[{"parts":[{"text":prompt}]}]}
+        data = call_gemini_api(payload)
         candidates = data.get("candidates", [])
         text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
         text = text or "⚠️ Yanıt boş."
-
-        # Cache ve hafıza güncelle
         gemma_cache[user_mesaj] = text
-        user_memory[user_id]["conversation"].append({"role": "nova", "text": text})
-        save_user_memory(user_id)
 
-        return jsonify({"response": text})
-    except Exception as e:
-        return jsonify({"response": f"⚠️ Hata: {e}"}), 500
+    user_memory[user_id]["conversation"].append({"role": "nova", "text": text})
+    save_user_memory(user_id)
+
+    return jsonify({"response": text})
 
 # --- Sunucu Başlat ---
 if __name__ == "__main__":
