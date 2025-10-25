@@ -19,7 +19,7 @@ user_memory = {}
 AFK_MODE = {"active": False, "last_active": time.time(), "speed_multiplier": 1.0}
 executor = ThreadPoolExecutor(max_workers=5)
 
-GEMINI_API_KEY = "AIzaSyBqWOT3n3LA8hJBriMGFFrmanLfkIEjhr0"  # Google Gemini API Key
+GEMINI_API_KEY = "AIzaSyBqWOT3n3LA8hJBriMGFFrmanLfkIEjhr0"  # Geçerli API key ile değiştir
 MODEL_NAME = "gemini-2.5-flash"
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 
@@ -40,29 +40,57 @@ def save_user_memory(user_id):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(user_memory[user_id], f, ensure_ascii=False, indent=2)
 
-def warmup_message(msg):
-    if msg in gemma_cache:
-        return
-    try:
-        payload = {"contents":[{"parts":[{"text":msg}]}]}
-        headers = {"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY}
-        resp = requests.post(GEMINI_API_URL, json=payload, headers=headers, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        candidates = data.get("candidates", [])
-        text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        gemma_cache[msg] = text
-    except:
-        gemma_cache[msg] = "⚠️ Hazırlık hatası"
+# 429 ve diğer hatalara karşı güvenli request
+def safe_request(payload, headers, retries=5, delay=2):
+    for attempt in range(retries):
+        try:
+            resp = requests.post(GEMINI_API_URL, json=payload, headers=headers, timeout=30)
+            if resp.status_code == 429:
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            if attempt == retries - 1:
+                raise e
+            time.sleep(delay)
+            delay *= 2
+    raise Exception("Too many requests veya bağlantı hatası, lütfen daha sonra tekrar deneyin.")
 
+# Kullanıcı mesajını işleyip cache ve memory ile birlikte Gemini API’ye gönder
+def get_gemma_response(prompt_text):
+    if prompt_text in gemma_cache:
+        return gemma_cache[prompt_text]
+
+    payload = {
+        "messages": [
+            {"role": "system", "content": [{"type": "text", "text": "Sen Nova, kişisel asistansın ve Türkçe konuşuyorsun."}]},
+            {"role": "user", "content": [{"type": "text", "text": prompt_text}]}
+        ],
+        "temperature": 0.7
+    }
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {GEMINI_API_KEY}"}
+    data = safe_request(payload, headers)
+    # API’den gelen yanıtı çıkar
+    candidates = data.get("candidates", [])
+    text = candidates[0].get("content", [{}])[0].get("text", "")
+    text = text or "⚠️ Yanıt boş."
+    gemma_cache[prompt_text] = text
+    return text
+
+# AFK warmup, rate limit dostu
 def afk_warmup():
+    warmup_interval = 120  # 2 dakika
+    warmup_messages = ["Merhaba!", "Nasılsın?"]
     while True:
-        time.sleep(10)
+        time.sleep(warmup_interval)
         idle_time = time.time() - AFK_MODE["last_active"]
-        if idle_time > 60:  # 1 dk AFK
+        if idle_time > 60:
             AFK_MODE["active"] = True
-            for msg in ["Merhaba!", "Nasılsın?", "Hava bugün nasıl?", "Selam!"]:
-                executor.submit(warmup_message, msg)
+            for msg in warmup_messages:
+                executor.submit(get_gemma_response, msg)
             AFK_MODE["speed_multiplier"] = 0.5
         else:
             AFK_MODE["active"] = False
@@ -82,7 +110,6 @@ def gemma():
         return jsonify({"response": "Mesaj boş"}), 400
 
     AFK_MODE["last_active"] = time.time()
-    speed = AFK_MODE["speed_multiplier"]
 
     # Kullanıcı hafızasını yükle
     if user_id not in user_memory:
@@ -90,8 +117,6 @@ def gemma():
 
     # Konuşmayı hafızaya ekle
     user_memory[user_id]["conversation"].append({"role": "user", "text": user_mesaj})
-
-    # Kullanıcı bilgilerini güncelle
     user_memory[user_id]["info"].update(user_info)
 
     # Prompt oluştur
@@ -102,22 +127,11 @@ def gemma():
         "Bu bilgilere dayanarak kişisel ve ilgili bir yanıt üret ve cevabı Türkçe ver."
     )
 
-    payload = {"contents":[{"parts":[{"text":prompt}]}]}
-    headers = {"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY}
-
     try:
-        resp = requests.post(GEMINI_API_URL, json=payload, headers=headers, timeout=30*speed)
-        resp.raise_for_status()
-        data = resp.json()
-        candidates = data.get("candidates", [])
-        text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        text = text or "⚠️ Yanıt boş."
-
-        # Cache ve hafıza güncelle
-        gemma_cache[user_mesaj] = text
+        text = get_gemma_response(prompt)
+        # Hafızaya ekle
         user_memory[user_id]["conversation"].append({"role": "nova", "text": text})
         save_user_memory(user_id)
-
         return jsonify({"response": text})
     except Exception as e:
         return jsonify({"response": f"⚠️ Hata: {e}"}), 500
